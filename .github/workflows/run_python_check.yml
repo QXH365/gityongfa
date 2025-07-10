@@ -1,0 +1,25 @@
+name: Check 1.py Output
+
+on: [push]  # 每次 push 代码时触发
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Run 1.py and check output
+        run: |
+          output=$(python 1.py)
+          echo "Script output: $output"
+          if [ "$output" != "1" ]; then
+            echo "❌ Output is not 1"
+            exit 1
+          fi
