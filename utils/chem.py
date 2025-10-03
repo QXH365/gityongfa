@@ -1,18 +1,18 @@
 from copy import deepcopy
-from typing import List, Tuple
-
+import torch
+from torchvision.transforms.functional import to_tensor
 import rdkit
 import rdkit.Chem.Draw
-import torch
 from rdkit import Chem
-from rdkit.Chem import PeriodicTable as PT
 from rdkit.Chem import rdDepictor as DP
+from rdkit.Chem import PeriodicTable as PT
 from rdkit.Chem import rdMolAlign as MA
-from rdkit.Chem.Draw import rdMolDraw2D as MD2
 from rdkit.Chem.rdchem import BondType as BT
-from rdkit.Chem.rdchem import GetPeriodicTable, Mol
+from rdkit.Chem.rdchem import Mol,GetPeriodicTable
+from rdkit.Chem.Draw import rdMolDraw2D as MD2
 from rdkit.Chem.rdmolops import RemoveHs
-from torchvision.transforms.functional import to_tensor
+from typing import List, Tuple
+
 
 BOND_TYPES = {t: i for i, t in enumerate(BT.names.values())}
 BOND_NAMES = {i: t for i, t in enumerate(BT.names.keys())}
@@ -110,7 +110,7 @@ def get_2D_mol(mol):
     return mol
 
 
-def draw_mol_svg(mol, molSize=(450, 150), kekulize=False):
+def draw_mol_svg(mol,molSize=(450,150),kekulize=False):
     mc = Chem.Mol(mol.ToBinary())
     if kekulize:
         try:
@@ -119,7 +119,7 @@ def draw_mol_svg(mol, molSize=(450, 150), kekulize=False):
             mc = Chem.Mol(mol.ToBinary())
     if not mc.GetNumConformers():
         DP.Compute2DCoords(mc)
-    drawer = MD2.MolDraw2DSVG(molSize[0], molSize[1])
+    drawer = MD2.MolDraw2DSVG(molSize[0],molSize[1])
     drawer.DrawMolecule(mc)
     drawer.FinishDrawing()
     svg = drawer.GetDrawingText()
@@ -135,3 +135,4 @@ def get_best_rmsd(probe, ref):
     ref = RemoveHs(ref)
     rmsd = MA.GetBestRMS(probe, ref)
     return rmsd
+
