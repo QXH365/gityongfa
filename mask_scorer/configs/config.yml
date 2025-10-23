@@ -1,0 +1,40 @@
+# configs/train_mask_gen.yml
+model:
+  embed_dim: 256
+  max_atomic_number: 100
+  num_bond_types: 25
+  num_convs: 6
+  activation: 'silu'
+  short_cut: true
+  concat_hidden: false
+  output_mlp_hidden_dims: [64, 32]
+
+train:
+  seed: 2024
+  batch_size: 256     # 根据显存调整
+  max_iters: 500000     # 总训练迭代次数
+  val_interval: 5000    # 每隔多少次迭代验证一次
+  log_interval: 100     # 每隔多少次迭代记录一次日志
+  save_interval: 10000   # 每隔多少次迭代保存一次检查点
+  max_grad_norm: 10.0
+  num_workers: 4        # DataLoader 工作进程数
+
+  optimizer:
+    type: adam
+    lr: 1.e-4           # 初始学习率
+    weight_decay: 0.
+    beta1: 0.95
+    beta2: 0.999
+
+  scheduler:
+    type: plateau      # 或者 cosine
+    factor: 0.6         # plateau: 降低因子
+    patience: 10        # plateau: 等待轮数 (注意这里按验证次数算)
+    min_lr: 1.0e-6      # 最小学习率
+    # type: cosine
+    # T_max: 500000     # cosine: 总迭代次数
+    # eta_min: 1.0e-6   # cosine: 最小学习率
+
+dataset:
+  train: ./geom_mask_data_100000/train_mask_gen.pkl # 你的训练数据路径
+  val: ./geom_mask_data_100000/test_mask_gen.pkl  # 你的验证/测试数据路径
