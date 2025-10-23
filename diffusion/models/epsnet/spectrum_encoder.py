@@ -1,216 +1,194 @@
-# diffusion/models/epsnet/spectrum_encoder.py
+# models/epsnet/spectrum_encoder.py
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
-# --- 辅助模块 ---
 
-class PatchEmbedding(nn.Module):
-    """将光谱序列分割成 patch 并进行线性投影"""
-    def __init__(self, seq_len=3500, patch_size=25, embed_dim=128):
-        super().__init__()
-        if seq_len % patch_size != 0:
-            raise ValueError(f"光谱长度 ({seq_len}) 必须能被 patch_size ({patch_size}) 整除。")
-        self.num_patches = seq_len // patch_size
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
-        # 线性投影层，将每个 patch 映射到 embed_dim
-        self.projection = nn.Linear(patch_size, embed_dim)
-
-    def forward(self, x):
-        # x: [B, 1, SeqLen]
-        B, C, L = x.shape
-        # Reshape to patches: [B, NumPatches, PatchSize]
-        patches = x.view(B, self.num_patches, self.patch_size)
-        # Project patches: [B, NumPatches, EmbedDim]
-        embeddings = self.projection(patches)
-        return embeddings
-
-class DisentanglementHead(nn.Module):
+# SpectralCIB 模块与之前版本保持一致，因为它负责的是后端的信息蒸馏，与前端特征提取解耦
+class SpectralCIB(nn.Module):
     """
-    信息瓶颈头，用于从特征序列中提取一组解耦的潜变量 (z)。
-    使用交叉注意力将信息压缩到 concept tokens，然后映射到高斯分布。
+    条件信息瓶颈 (Conditional Information Bottleneck) 模块。
+    使用 Transformer 架构，将特征序列压缩为一组服从高斯分布的低维潜变量（“光谱概念”）。
     """
-    def __init__(self, embed_dim=128, num_heads=4, num_concepts=8):
+
+    def __init__(self, embed_dim=128, num_heads=4, num_layers=2, num_concepts=8):
         super().__init__()
         self.num_concepts = num_concepts
-        self.embed_dim = embed_dim
 
-        # 可学习的 "概念" token
+        # Transformer Encoder 用于捕捉 patch 序列之间的内部相关性
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            batch_first=True,
+            dim_feedforward=embed_dim * 4,
+            activation="gelu",
+            dropout=0.1,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # 可学习的 "概念" token，作为信息压缩的“容器”
         self.concept_tokens = nn.Parameter(torch.randn(1, num_concepts, embed_dim))
 
-        # 交叉注意力模块
-        self.compress_attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=0.1)
-        self.norm1 = nn.LayerNorm(embed_dim)
+        # 交叉注意力模块，将 patch 序列的信息“注入”到 concept token 中
+        self.compress_attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
 
-        # 前馈网络
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(embed_dim * 4, embed_dim),
-            nn.Dropout(0.1)
-        )
-        self.norm2 = nn.LayerNorm(embed_dim)
-
-        # 线性层映射到高斯分布参数
+        # 线性层，将交叉注意力的输出映射为高斯分布的均值 (mu) 和对数方差 (log_var)
         self.fc_mu = nn.Linear(embed_dim, embed_dim)
         self.fc_log_var = nn.Linear(embed_dim, embed_dim)
 
+        self.norm = nn.LayerNorm(embed_dim)
+
     def reparameterize(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        """重参数化技巧，使得从分布中采样的过程可导。"""
         std = torch.exp(0.5 * log_var)
         epsilon = torch.randn_like(std)
         return mu + epsilon * std
 
-    def forward(self, feature_sequence: torch.Tensor):
+    def forward(self, feature_sequence: torch.Tensor, condition_vector=None):
         """
-        Args:
-            feature_sequence (torch.Tensor): 输入的特征序列 (B, SeqLen, EmbedDim)
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: mu, log_var, z
-                - mu (torch.Tensor): 潜变量均值 (B, NumConcepts, EmbedDim)
-                - log_var (torch.Tensor): 潜变量对数方差 (B, NumConcepts, EmbedDim)
-                - z (torch.Tensor): 采样得到的潜变量 (B, NumConcepts, EmbedDim)
+        返回:
+            - z (torch.Tensor): 从潜变量分布中采样得到的光谱概念。(B, NumConcepts, EmbedDim)
+            - kl_loss (torch.Tensor): 潜变量分布与标准正态分布之间的KL散度损失。
         """
         batch_size = feature_sequence.size(0)
 
-        # 1. 交叉注意力：用 concept_tokens 去查询 feature_sequence
-        attn_output, _ = self.compress_attention(
-            query=self.concept_tokens.expand(batch_size, -1, -1),
-            key=feature_sequence,
-            value=feature_sequence
+        # 1. 特征序列内部的自注意力
+        processed_sequence = self.transformer_encoder(feature_sequence)
+
+        # 2. 交叉注意力：用 concept_tokens 去查询 processed_sequence
+        compressed_output, _ = self.compress_attention(
+            query=self.concept_tokens.expand(batch_size, -1, -1), key=processed_sequence, value=processed_sequence
         )
-        # Add & Norm
-        compressed_output = self.norm1(self.concept_tokens.expand(batch_size, -1, -1) + attn_output)
+        compressed_output = self.norm(compressed_output)
 
-        # 2. 前馈网络
-        ffn_output = self.ffn(compressed_output)
-        # Add & Norm
-        processed_output = self.norm2(compressed_output + ffn_output)
+        # 3. 将压缩后的输出映射为高斯分布的参数
+        mu = self.fc_mu(compressed_output)
+        log_var = self.fc_log_var(compressed_output)
 
-        # 3. 映射为高斯分布参数
-        mu = self.fc_mu(processed_output)
-        log_var = self.fc_log_var(processed_output)
-
-        # 4. 重参数化采样
+        # 4. 使用重参数化技巧进行采样
         z = self.reparameterize(mu, log_var)
 
-        return mu, log_var, z
+        # 5. 计算 KL 散度损失
+        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+        kl_loss = kl_loss / batch_size
 
-# --- KL 散度计算函数 ---
+        return z, kl_loss
 
-def kl_divergence_gaussian(mu1, log_var1, mu2, log_var2, reduce='mean'):
+
+class CNNBranch(nn.Module):
     """
-    计算两组对角多元高斯分布之间的 KL 散度 KL(N(mu1, var1) || N(mu2, var2))。
-    Args:
-        mu1, log_var1: 第一组分布的参数 (B, NumConcepts, EmbedDim)
-        mu2, log_var2: 第二组分布的参数 (B, NumConcepts, EmbedDim)
-        reduce: 'mean' 或 'sum'，如何在 batch 维度上聚合 KL 散度。
-    Returns:
-        torch.Tensor: KL 散度值 (标量)。
+    用于处理单一光谱（IR或Raman）的CNN分支，实现高保真局部特征提取。
     """
-    var1 = torch.exp(log_var1)
-    var2 = torch.exp(log_var2)
-    kl_components = 0.5 * (
-        log_var2 - log_var1 + (var1 + (mu1 - mu2)**2) / (var2 + 1e-8) - 1
-    )
-    # 在 concept 和 embed_dim 维度上求和
-    kl_per_sample = torch.sum(kl_components, dim=[1, 2])
 
-    if reduce == 'mean':
-        return torch.mean(kl_per_sample)
-    elif reduce == 'sum':
-        return torch.sum(kl_per_sample)
-    else:
-        raise ValueError("reduce 参数必须是 'mean' 或 'sum'")
+    def __init__(self, cnn_out_channels=64, kernel_size=11, stride=2):
+        super().__init__()
 
-# --- 新的光谱编码器 ---
+        # 【修正】: 手动计算 padding 来替代 'same'
+        # 当 stride=2 时, padding = (kernel_size - 1) // 2 可以很好地模拟'same'并使长度减半
+        # 对于 kernel_size=11, padding = (11-1)//2 = 5
+        padding = (kernel_size - 1) // 2
 
-class SpectrumEncoderDisentangled(nn.Module):
+        self.conv1 = nn.Conv1d(1, 32, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.bn1 = nn.BatchNorm1d(32)
+        self.conv2 = nn.Conv1d(32, cnn_out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.bn2 = nn.BatchNorm1d(cnn_out_channels)
+
+    def forward(self, x):
+        # x: [B, 1, SeqLen]
+        # 经过两层 stride=2 的卷积，序列长度变为 SeqLen / 4
+        features = F.relu(self.bn1(self.conv1(x)))
+        features = F.relu(self.bn2(self.conv2(features)))
+        # 输出: [B, cnn_out_channels, SeqLen / 4]
+        return features
+
+
+class Spectroformer(nn.Module):
     """
-    使用 Patch Attention 和 KL 散度损失实现信息解耦的光谱编码器。
-    流程: Patchify -> Embed -> Transformer -> Concat -> Disentanglement Heads -> KL Loss
+    全新的光谱编码器，实现了分层的、高分辨率的特征提取与抽象。
+    流程: (CNN -> Concat) -> Patchify -> Project -> Transformer -> CIB
     """
+
     def __init__(self, config):
         super().__init__()
 
         # --- 参数配置 ---
-        # 从 config.model (EasyDict) 中获取参数，提供默认值
-        seq_len = config.model.get('spec_seq_len', 3500)
-        patch_size = config.model.get('spec_patch_size', 25) # 3500 / 25 = 140 patches
-        embed_dim = config.model.get('spec_embed_dim', 128)
-        num_heads_tf = config.model.get('spec_num_heads_tf', 8) # Transformer Encoder 头数
-        num_layers_tf = config.model.get('spec_num_layers_tf', 4) # Transformer Encoder 层数
-        num_heads_dis = config.model.get('spec_num_heads_dis', 4) # Disentanglement Head 头数
-        num_concepts1 = config.model.get('spec_num_concepts1', 8) # z1 的概念数
-        num_concepts2 = config.model.get('spec_num_concepts2', 8) # z2 的概念数
-        dropout = config.model.get('spec_dropout', 0.1)
+        ir_len = config.model.get("target_ir_len", 3500)
+        raman_len = config.model.get("target_raman_len", 3500)
 
-        # 检查光谱长度是否能被 patch_size 整除
-        if seq_len % patch_size != 0:
-            raise ValueError(f"光谱长度 ({seq_len}) 必须能被 patch_size ({patch_size}) 整除。")
-        num_patches = seq_len // patch_size
+        cnn_out_channels = config.model.get("spec_cnn_out_channels", 64)
+        cnn_kernel_size = config.model.get("spec_cnn_kernel_size", 11)
+        cnn_stride = 2
+        num_cnn_layers_with_stride = 2
+
+        # 重新计算拼接长度: (3500/4) + (3500/4) = 875 + 875 = 1750
+        concat_len = (ir_len // (cnn_stride**num_cnn_layers_with_stride)) + (
+            raman_len // (cnn_stride**num_cnn_layers_with_stride)
+        )
+
+        # 重新计算分片大小: 1750 / 70 = 25. 最终序列长度为 70.
+        patch_size = config.model.get("spec_patch_size", 25)
+        if concat_len % patch_size != 0:
+            raise ValueError(f"拼接后的CNN特征长度({concat_len})无法被patch_size({patch_size})整除。")
+
+        num_patches = concat_len // patch_size
+        patch_dim = cnn_out_channels * patch_size
+
+        embed_dim = config.model.get("spec_embed_dim", 128)
 
         # --- 模型层定义 ---
+        self.cnn_ir = CNNBranch(cnn_out_channels, cnn_kernel_size, cnn_stride)
+        self.cnn_raman = CNNBranch(cnn_out_channels, cnn_kernel_size, cnn_stride)
 
-        # 1. Patch Embedding (共享 IR 和 Raman)
-        self.patch_embed = PatchEmbedding(seq_len, patch_size, embed_dim)
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+        self.patch_dim = patch_dim
 
-        # 2. 位置编码 (IR 和 Raman 分开)
-        self.pos_embed_ir = nn.Parameter(torch.randn(1, num_patches, embed_dim))
-        self.pos_embed_raman = nn.Parameter(torch.randn(1, num_patches, embed_dim))
-        self.embed_dropout = nn.Dropout(dropout)
+        # 线性层，负责将每个展平的光谱分片映射到高维嵌入空间
+        self.patch_projection = nn.Linear(patch_dim, embed_dim)
 
-        # 3. Transformer Encoder (共享 IR 和 Raman)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads_tf, batch_first=True,
-            dim_feedforward=embed_dim * 4, activation='gelu', dropout=dropout
+        # 可学习的位置编码
+        self.position_embedding = nn.Parameter(torch.randn(1, num_patches, embed_dim))
+
+        # 条件信息瓶颈模块
+        self.cib = SpectralCIB(
+            embed_dim=embed_dim,
+            num_heads=config.model.spec_num_heads,
+            num_layers=config.model.spec_num_layers,
+            num_concepts=config.model.spec_num_concepts,
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers_tf)
 
-        # 4. 信息解耦头 (两个独立实例)
-        self.disentanglement_head1 = DisentanglementHead(embed_dim, num_heads_dis, num_concepts1)
-        self.disentanglement_head2 = DisentanglementHead(embed_dim, num_heads_dis, num_concepts2)
-
-    def forward(self, batch):
+    def forward(self, batch, condition_vector=None):
         # 1. 数据准备
-        # 确保输入光谱形状为 [B, 1, SeqLen]
         ir_spec = batch.ir_spectrum.view(batch.num_graphs, 1, -1)
         raman_spec = batch.raman_spectrum.view(batch.num_graphs, 1, -1)
 
-        # 2. Patching 和 Embedding
-        ir_embeddings = self.patch_embed(ir_spec)   # [B, NumPatches, EmbedDim]
-        raman_embeddings = self.patch_embed(raman_spec) # [B, NumPatches, EmbedDim]
+        # 2. 双分支CNN高保真局部特征提取
+        ir_features = self.cnn_ir(ir_spec)  # [B, C, 875]
+        raman_features = self.cnn_raman(raman_spec)  # [B, C, 875]
 
-        # 3. 添加位置编码
-        ir_embeddings = self.embed_dropout(ir_embeddings + self.pos_embed_ir)
-        raman_embeddings = self.embed_dropout(raman_embeddings + self.pos_embed_raman)
+        # 3. 特征序列拼接
+        # [B, C, 1750]
+        concat_features = torch.cat([ir_features, raman_features], dim=2)
 
-        # 4. 通过共享 Transformer Encoder
-        processed_ir = self.transformer_encoder(ir_embeddings)    # [B, NumPatches, EmbedDim]
-        processed_raman = self.transformer_encoder(raman_embeddings) # [B, NumPatches, EmbedDim]
+        # 4. 分片 (Patching)
+        # 调整维度以进行分片: [B, 1750, C]
+        concat_features = concat_features.permute(0, 2, 1)
 
-        # 5. 特征序列拼接
-        combined_features = torch.cat([processed_ir, processed_raman], dim=1) # [B, 2 * NumPatches, EmbedDim]
+        B, L, C = concat_features.shape
+        # [B, 70, 25, C]
+        patches = concat_features.view(B, self.num_patches, self.patch_size, C)
+        # 展平每个patch: [B, 70, 25 * C]
+        patches_flattened = patches.flatten(2)
 
-        # 6. 通过两个解耦头
-        mu1, log_var1, z1 = self.disentanglement_head1(combined_features)
-        mu2, log_var2, z2 = self.disentanglement_head2(combined_features)
+        # 5. 分片投影
+        # [B, 70, embed_dim]
+        patch_embeddings = self.patch_projection(patches_flattened)
 
-        # 7. 计算 KL 散度损失 (最大化分离度)
-        kl_12 = kl_divergence_gaussian(mu1, log_var1, mu2, log_var2, reduce='mean')
-        kl_21 = kl_divergence_gaussian(mu2, log_var2, mu1, log_var1, reduce='mean')
-        # 我们想最大化 KL，所以在总损失中添加 - (kl_12 + kl_21)
-        # 注意：这里只计算损失值，不直接添加到模型的总损失中，由训练脚本处理
-        kl_separation_loss = -(kl_12 + kl_21)
+        # 6. 添加位置编码
+        patch_embeddings = patch_embeddings + self.position_embedding
 
-        # 8. (可选) 计算与标准正态分布的 KL，用于正则化每个 z (类似 VAE)
-        # kl_prior1 = kl_divergence_gaussian(mu1, log_var1, torch.zeros_like(mu1), torch.zeros_like(log_var1))
-        # kl_prior2 = kl_divergence_gaussian(mu2, log_var2, torch.zeros_like(mu2), torch.zeros_like(log_var2))
-        # total_kl_prior = kl_prior1 + kl_prior2
+        # 7. 信息瓶颈与概念提取
+        spectral_concepts, kl_loss = self.cib(patch_embeddings, condition_vector)
 
-        # 返回解耦的潜变量和分离损失
-        # 训练脚本需要将 kl_separation_loss (乘以一个权重) 添加到总损失中
-        return z1, z2, kl_separation_loss #, total_kl_prior # 如果需要正则化
+        return spectral_concepts, kl_loss
